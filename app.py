@@ -54,12 +54,20 @@ st.markdown(
 )
 
 # -----------------------------------------------------------------------------
+# API key — read from Streamlit Secrets, never from user input
+# -----------------------------------------------------------------------------
+
+try:
+    api_key = st.secrets["OPENAI_API_KEY"]
+except (KeyError, FileNotFoundError):
+    api_key = ""
+
+# -----------------------------------------------------------------------------
 # Sidebar
 # -----------------------------------------------------------------------------
 
 with st.sidebar:
     st.markdown("## Configuration")
-    api_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
     model = st.selectbox(
         "Model",
         ["gpt-4o", "gpt-4-turbo", "gpt-4"],
@@ -118,7 +126,6 @@ def _collect_uploaded_files(uploaded_files) -> tuple[list[dict[str, str]], list[
                         dest = _safe_unique_path(temp_dir, member_path.name, counter)
                         with open(dest, "wb") as output_file:
                             output_file.write(zip_file.read(member))
-                        # Keep the original basename for lesson-id parsing; only the disk path is made unique.
                         file_records.append({"name": member_path.name, "path": dest})
             except zipfile.BadZipFile:
                 errors.append(f"{uploaded_file.name}: invalid or corrupted ZIP archive.")
@@ -170,6 +177,10 @@ st.markdown(
     '<div class="subtitle">Generates 120 quiz questions across 3 non-overlapping sets from PTx and Transcript lesson files.</div>',
     unsafe_allow_html=True,
 )
+
+if not api_key:
+    st.error("OpenAI API key is not configured. Add OPENAI_API_KEY to Streamlit Secrets.")
+    st.stop()
 
 st.markdown('<div class="section-hdr">Upload Lesson Files</div>', unsafe_allow_html=True)
 st.markdown(
@@ -303,10 +314,6 @@ st.markdown('<div class="section-hdr">Generate Quiz</div>', unsafe_allow_html=Tr
 st.markdown(
     f"Will generate {NUM_SETS} sets x {QUESTIONS_PER_SET} questions = {NUM_SETS * QUESTIONS_PER_SET} total using {len(content_lessons)} content-bearing lessons."
 )
-
-if not api_key:
-    st.warning("Enter your OpenAI API Key in the sidebar to continue.")
-    st.stop()
 
 if st.button(f"Generate {NUM_SETS * QUESTIONS_PER_SET} Questions", type="primary", use_container_width=True):
     progress_bar = st.progress(0)
