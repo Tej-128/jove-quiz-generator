@@ -1,5 +1,5 @@
 """
-JoVE Quiz Generator - Streamlit App v3.2 Team-Key
+JoVE Quiz Generator - Streamlit App v3.2.3 Flexible-PTx Team-Key
 Standalone tool: generates 120 questions (3 sets x 40) from PTx / Transcript docx files.
 """
 
@@ -64,8 +64,15 @@ st.session_state.setdefault("upload_signature", None)
 # API key - configured once for the team, not entered by each user
 # -----------------------------------------------------------------------------
 
+# Optional local/team slot. Leave blank when using Streamlit Secrets or env vars.
+# Do not commit a real key to a shared/public repository.
+TEAM_OPENAI_API_KEY = ""
+
+
 def _get_configured_api_key() -> str:
-    """Read the OpenAI key from Streamlit Secrets, with env-var fallback for local runs."""
+    """Read the OpenAI key from team slot, Streamlit Secrets, then env-var fallback."""
+    if TEAM_OPENAI_API_KEY.strip():
+        return TEAM_OPENAI_API_KEY.strip()
     try:
         secret_value = st.secrets.get("OPENAI_API_KEY", "")
     except Exception:
@@ -103,7 +110,7 @@ with st.sidebar:
 """
     )
     st.markdown("---")
-    st.caption("JoVE Internal Tool - v3.2 Team-Key")
+    st.caption("JoVE Internal Tool - v3.2.3 Flexible-PTx")
 
 # -----------------------------------------------------------------------------
 # Upload and extraction helpers
@@ -203,12 +210,14 @@ if not api_key:
 st.markdown('<div class="section-hdr">Upload Lesson Files</div>', unsafe_allow_html=True)
 st.markdown(
     """
-Upload PTx (`_PTx_NS.docx`) and/or Transcript (`_Transcript.docx`) files for one chapter.
+Upload PTx files (`_PTx.docx`, `_PTx_NS.docx`, `_PTx_RS.docx`, or `_PTx_<initials>.docx`) and/or Transcript (`_Transcript.docx`) files for one chapter.
 A ZIP containing `.docx` files is also accepted.
 
 Required naming examples:
 ```
 10677_What_Are_Proteins_PTx_NS.docx
+10683_What_Are_Lipids__PTx_RS.docx
+10679_Protein_Folding_PTx.docx
 10677_What_Are_Proteins_Transcript.docx
 ```
 """
@@ -241,7 +250,7 @@ st.markdown("---")
 st.markdown('<div class="section-hdr">Detected Lessons</div>', unsafe_allow_html=True)
 
 if not lessons:
-    st.error("No valid lesson files found. Filenames must start with a numeric Lesson ID and end with `_PTx_NS.docx` or `_Transcript.docx`.")
+    st.error("No valid lesson files found. Filenames must start with a numeric Lesson ID and end with `_PTx.docx`, `_PTx_<initials>.docx`, or `_Transcript.docx`.")
     skipped = parse_report.get("skipped_files", []) or []
     if skipped:
         with st.expander("Skipped files"):
