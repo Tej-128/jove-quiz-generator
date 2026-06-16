@@ -1,5 +1,5 @@
 """
-JoVE Quiz Generator - Streamlit App v3.1
+JoVE Quiz Generator - Streamlit App v3.2 Team-Key
 Standalone tool: generates 120 questions (3 sets x 40) from PTx / Transcript docx files.
 """
 
@@ -54,13 +54,26 @@ st.markdown(
 )
 
 # -----------------------------------------------------------------------------
-# API key — read from Streamlit Secrets, never from user input
+# Session state
 # -----------------------------------------------------------------------------
 
-try:
-    api_key = st.secrets["OPENAI_API_KEY"]
-except (KeyError, FileNotFoundError):
-    api_key = ""
+st.session_state.setdefault("quiz_result", None)
+st.session_state.setdefault("upload_signature", None)
+
+# -----------------------------------------------------------------------------
+# API key - configured once for the team, not entered by each user
+# -----------------------------------------------------------------------------
+
+def _get_configured_api_key() -> str:
+    """Read the OpenAI key from Streamlit Secrets, with env-var fallback for local runs."""
+    try:
+        secret_value = st.secrets.get("OPENAI_API_KEY", "")
+    except Exception:
+        secret_value = ""
+    return str(secret_value or os.environ.get("OPENAI_API_KEY", "")).strip()
+
+
+api_key = _get_configured_api_key()
 
 # -----------------------------------------------------------------------------
 # Sidebar
@@ -68,6 +81,10 @@ except (KeyError, FileNotFoundError):
 
 with st.sidebar:
     st.markdown("## Configuration")
+    if api_key:
+        st.success("OpenAI API key configured for this app.")
+    else:
+        st.error("OPENAI_API_KEY is not configured in Streamlit Secrets or environment variables.")
     model = st.selectbox(
         "Model",
         ["gpt-5.5", "gpt-4o", "gpt-4-turbo", "gpt-4"],
@@ -86,7 +103,7 @@ with st.sidebar:
 """
     )
     st.markdown("---")
-    st.caption("JoVE Internal Tool - v3.1")
+    st.caption("JoVE Internal Tool - v3.2 Team-Key")
 
 # -----------------------------------------------------------------------------
 # Upload and extraction helpers
@@ -126,6 +143,7 @@ def _collect_uploaded_files(uploaded_files) -> tuple[list[dict[str, str]], list[
                         dest = _safe_unique_path(temp_dir, member_path.name, counter)
                         with open(dest, "wb") as output_file:
                             output_file.write(zip_file.read(member))
+                        # Keep the original basename for lesson-id parsing; only the disk path is made unique.
                         file_records.append({"name": member_path.name, "path": dest})
             except zipfile.BadZipFile:
                 errors.append(f"{uploaded_file.name}: invalid or corrupted ZIP archive.")
@@ -179,7 +197,7 @@ st.markdown(
 )
 
 if not api_key:
-    st.error("OpenAI API key is not configured. Add OPENAI_API_KEY to Streamlit Secrets.")
+    st.error("OpenAI API key is not configured. Add OPENAI_API_KEY to Streamlit Secrets or set it as an environment variable.")
     st.stop()
 
 st.markdown('<div class="section-hdr">Upload Lesson Files</div>', unsafe_allow_html=True)
@@ -315,6 +333,82 @@ st.markdown(
     f"Will generate {NUM_SETS} sets x {QUESTIONS_PER_SET} questions = {NUM_SETS * QUESTIONS_PER_SET} total using {len(content_lessons)} content-bearing lessons."
 )
 
+upload_signature = tuple((uploaded_file.name, getattr(uploaded_file, "size", None)) for uploaded_file in uploaded)
+if st.session_state.upload_signature != upload_signature:
+    st.session_state.upload_signature = upload_signature
+    st.session_state.quiz_result = None
+
+
+def _render_results(result: dict) -> None:
+    all_sets = result["all_sets"]
+    report = result["report"]
+    excel_bytes = result["excel_bytes"]
+    result_chapter_name = result["chapter_name"]
+
+    st.markdown("---")
+    st.markdown('<div class="section-hdr">Results</div>', unsafe_allow_html=True)
+
+    total_generated = sum(len(question_set) for question_set in all_sets)
+    target = NUM_SETS * QUESTIONS_PER_SET
+    result_cols = st.columns(4)
+    with result_cols[0]:
+        st.markdown(
+            f'<div class="stat-box"><div class="stat-label">Total Generated</div><div class="stat-value">{total_generated}</div></div>',
+            unsafe_allow_html=True,
+        )
+    with result_cols[1]:
+        st.markdown(
+            f'<div class="stat-box"><div class="stat-label">Target</div><div class="stat-value">{target}</div></div>',
+            unsafe_allow_html=True,
+        )
+    with result_cols[2]:
+        st.markdown(
+            f'<div class="stat-box"><div class="stat-label">Sets</div><div class="stat-value">{len(all_sets)}</div></div>',
+            unsafe_allow_html=True,
+        )
+    with result_cols[3]:
+        st.markdown(
+            f'<div class="stat-box"><div class="stat-label">Warnings</div><div class="stat-value">{len(report.get("warnings", []))}</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("**Question type distribution across sets:**")
+    distribution_df = _build_type_distribution(report)
+    st.dataframe(distribution_df, hide_index=True, use_container_width=True)
+
+    dropped_types = report.get("fallback_types_dropped", []) or []
+    if dropped_types:
+        st.markdown(
+            f'<div class="warn-box">Fallback applied. Dropped types: {", ".join(dropped_types)}</div>',
+            unsafe_allow_html=True,
+        )
+
+    warnings = report.get("warnings", []) or []
+    if warnings:
+        with st.expander(f"Warnings / flags ({len(warnings)})"):
+            for warning in warnings:
+                st.markdown(f'<div class="warn-box">{warning}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="ok-box">No warnings. All accepted questions passed validation.</div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+    safe_chapter = re.sub(r"[^A-Za-z0-9_.-]+", "_", result_chapter_name).strip("_") if result_chapter_name else "Chapter"
+    download_kwargs = {
+        "label": "Download Quiz Excel",
+        "data": excel_bytes,
+        "file_name": f"JoVE_Quiz_{safe_chapter}.xlsx",
+        "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "use_container_width": True,
+        "type": "primary",
+    }
+    try:
+        st.download_button(**download_kwargs, on_click="ignore")
+    except TypeError:
+        # Older Streamlit versions do not support on_click="ignore". Session state still
+        # keeps the results visible after the rerun.
+        st.download_button(**download_kwargs)
+
+
 if st.button(f"Generate {NUM_SETS * QUESTIONS_PER_SET} Questions", type="primary", use_container_width=True):
     progress_bar = st.progress(0)
     status_area = st.empty()
@@ -345,67 +439,21 @@ if st.button(f"Generate {NUM_SETS * QUESTIONS_PER_SET} Questions", type="primary
         workbook = build_excel(all_sets, report, chapter_name)
         buffer = io.BytesIO()
         workbook.save(buffer)
-        buffer.seek(0)
+        excel_bytes = buffer.getvalue()
         progress_callback("Excel output ready", 100)
         status_area.success("Done.")
 
-        st.markdown("---")
-        st.markdown('<div class="section-hdr">Results</div>', unsafe_allow_html=True)
-
-        total_generated = sum(len(question_set) for question_set in all_sets)
-        target = NUM_SETS * QUESTIONS_PER_SET
-        result_cols = st.columns(4)
-        with result_cols[0]:
-            st.markdown(
-                f'<div class="stat-box"><div class="stat-label">Total Generated</div><div class="stat-value">{total_generated}</div></div>',
-                unsafe_allow_html=True,
-            )
-        with result_cols[1]:
-            st.markdown(
-                f'<div class="stat-box"><div class="stat-label">Target</div><div class="stat-value">{target}</div></div>',
-                unsafe_allow_html=True,
-            )
-        with result_cols[2]:
-            st.markdown(
-                f'<div class="stat-box"><div class="stat-label">Sets</div><div class="stat-value">{len(all_sets)}</div></div>',
-                unsafe_allow_html=True,
-            )
-        with result_cols[3]:
-            st.markdown(
-                f'<div class="stat-box"><div class="stat-label">Warnings</div><div class="stat-value">{len(report.get("warnings", []))}</div></div>',
-                unsafe_allow_html=True,
-            )
-
-        st.markdown("**Question type distribution across sets:**")
-        distribution_df = _build_type_distribution(report)
-        st.dataframe(distribution_df, hide_index=True, use_container_width=True)
-
-        dropped_types = report.get("fallback_types_dropped", []) or []
-        if dropped_types:
-            st.markdown(
-                f'<div class="warn-box">Fallback applied. Dropped types: {", ".join(dropped_types)}</div>',
-                unsafe_allow_html=True,
-            )
-
-        warnings = report.get("warnings", []) or []
-        if warnings:
-            with st.expander(f"Warnings / flags ({len(warnings)})"):
-                for warning in warnings:
-                    st.markdown(f'<div class="warn-box">{warning}</div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div class="ok-box">No warnings. All accepted questions passed validation.</div>', unsafe_allow_html=True)
-
-        st.markdown("---")
-        safe_chapter = re.sub(r"[^A-Za-z0-9_.-]+", "_", chapter_name).strip("_") if chapter_name else "Chapter"
-        st.download_button(
-            label="Download Quiz Excel",
-            data=buffer,
-            file_name=f"JoVE_Quiz_{safe_chapter}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            type="primary",
-        )
+        st.session_state.quiz_result = {
+            "all_sets": all_sets,
+            "report": report,
+            "excel_bytes": excel_bytes,
+            "chapter_name": chapter_name,
+        }
 
     except Exception as exc:
+        st.session_state.quiz_result = None
         st.error(f"Generation failed: {exc}")
         st.code(traceback.format_exc())
+
+if st.session_state.quiz_result is not None:
+    _render_results(st.session_state.quiz_result)
