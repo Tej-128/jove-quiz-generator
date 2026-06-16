@@ -463,39 +463,56 @@ Additional requirements:
 # -----------------------------------------------------------------------------
 
 
+class LLMRequestError(RuntimeError):
+    """Raised when the OpenAI request fails before any usable model output is returned."""
+
+
+def _looks_like_unsupported_param_error(exc: Exception, param_name: str) -> bool:
+    message = str(exc).lower()
+    return param_name.lower() in message and (
+        "unsupported" in message or "unrecognized" in message or "not supported" in message
+    )
+
+
 def call_llm(system: str, user: str, api_key: str, model: str = "gpt-4o") -> str:
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+    request_args = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.65,
+    }
+    completion_limit = 16000
 
     try:
         from openai import OpenAI  # type: ignore
+    except (ImportError, AttributeError) as exc:
+        raise LLMRequestError(
+            "OpenAI Python SDK is missing or incompatible. Install/upgrade the openai package."
+        ) from exc
 
-        client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.65,
-            max_tokens=16000,
-        )
-        return response.choices[0].message.content or ""
-    except (ImportError, AttributeError):
+    client = OpenAI(api_key=api_key)
+    try:
         try:
-            import openai  # type: ignore
-
-            openai.api_key = api_key
-            response = openai.ChatCompletion.create(
-                model=model,
-                messages=messages,
-                temperature=0.65,
-                max_tokens=16000,
+            response = client.chat.completions.create(
+                **request_args,
+                max_completion_tokens=completion_limit,
             )
-            return response["choices"][0]["message"]["content"] or ""
         except Exception as exc:
-            raise RuntimeError(
-                "OpenAI Python SDK is missing or incompatible. Install/upgrade the openai package."
-            ) from exc
+            # Prefer max_completion_tokens because newer reasoning models reject max_tokens.
+            # Fall back only when max_completion_tokens itself is rejected by an older/non-standard model.
+            if not _looks_like_unsupported_param_error(exc, "max_completion_tokens"):
+                raise
+            response = client.chat.completions.create(
+                **request_args,
+                max_tokens=completion_limit,
+            )
+    except Exception as exc:
+        raise LLMRequestError(str(exc)) from exc
+
+    return response.choices[0].message.content or ""
 
 
 def parse_llm_json(raw: str) -> list[dict[str, Any]]:
@@ -1086,6 +1103,8 @@ def generate_quiz(
             )
             raw = call_llm(SYSTEM_PROMPT, initial_prompt, api_key, model)
             raw_questions = parse_llm_json(raw)
+        except LLMRequestError as exc:
+            raise RuntimeError(f"OpenAI request failed before question generation: {exc}") from exc
         except Exception as exc:
             set_warnings.append(f"Set {set_number}: initial generation failed or returned invalid JSON: {exc}")
             raw_questions = []
@@ -1143,6 +1162,8 @@ def generate_quiz(
                     )
                     raw_topup = call_llm(SYSTEM_PROMPT, topup_prompt, api_key, model)
                     topup_questions = parse_llm_json(raw_topup)
+                except LLMRequestError as exc:
+                    raise RuntimeError(f"OpenAI request failed during top-up attempt {attempt}: {exc}") from exc
                 except Exception as exc:
                     set_warnings.append(f"Set {set_number}: top-up attempt {attempt} failed: {exc}")
                     topup_questions = []
