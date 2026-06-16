@@ -1,9 +1,9 @@
 """
-JoVE Quiz Generator - Core Engine v3.1
+JoVE Quiz Generator - Core Engine v3.2.3 Flexible-PTx
 Standalone quiz generation engine for 3 sets x 40 questions from PTx and Transcript docx files.
 
 Primary changes in v3.1:
-- Strict filename detection: *_PTx_NS.docx and *_Transcript.docx only.
+- Flexible PTx filename detection: *_PTx.docx, *_PTx_NS.docx, *_PTx_RS.docx, and *_PTx_<initials>.docx.
 - No hardcoded chapter-name fallback. Chapter name must come from PTx content.
 - Validator rejects malformed or over-quota questions instead of exporting them.
 - Per-set cap of exactly 40 accepted questions when generation succeeds.
@@ -122,7 +122,21 @@ def _filename_lesson_id(stem: str) -> str:
 
 
 def _is_ptx_filename(stem: str) -> bool:
-    return stem.lower().endswith("_ptx_ns")
+    """
+    Accept JoVE PTx files whose filename has a terminal PTx token.
+
+    Valid examples:
+        10677_What_Are_Proteins_PTx.docx
+        10677_What_Are_Proteins_PTx_NS.docx
+        10683_What_Are_Lipids__PTx_RS.docx
+        10684_Nucleic_Acids_PTx_AB.docx
+
+    This intentionally requires PTx to be the final semantic token, with an
+    optional initials/version suffix, so files like Notes.docx or Transcript.docx
+    do not become ghost PTx lessons.
+    """
+    lower_stem = stem.lower()
+    return re.search(r"(?:^|_)ptx(?:_[a-z]{1,4})?$", lower_stem) is not None
 
 
 def _is_transcript_filename(stem: str) -> bool:
@@ -193,7 +207,7 @@ def parse_lesson_files(uploaded_files: list[dict[str, str]], return_report: bool
             report["skipped_files"].append({
                 "name": name,
                 "lesson_id": lesson_id,
-                "reason": "not a *_PTx_NS.docx or *_Transcript.docx file",
+                "reason": "not a valid PTx file (*_PTx.docx or *_PTx_<initials>.docx) or *_Transcript.docx file",
             })
             continue
 
