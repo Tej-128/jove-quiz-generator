@@ -70,7 +70,7 @@ with st.sidebar:
     st.markdown("## Configuration")
     model = st.selectbox(
         "Model",
-        ["gpt-4o", "gpt-4-turbo", "gpt-4"],
+        ["gpt-5.5", "gpt-4o", "gpt-4-turbo", "gpt-4"],
         index=0,
         help="Use a strong model for better grounding and formatting adherence.",
     )
