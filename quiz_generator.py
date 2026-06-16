@@ -1,5 +1,5 @@
 """
-JoVE Quiz Generator - Core Engine v3.2.3 Flexible-PTx
+JoVE Quiz Generator - Core Engine v3.2.4
 Standalone quiz generation engine for 3 sets x 40 questions from PTx and Transcript docx files.
 
 Primary changes in v3.1:
@@ -207,7 +207,7 @@ def parse_lesson_files(uploaded_files: list[dict[str, str]], return_report: bool
             report["skipped_files"].append({
                 "name": name,
                 "lesson_id": lesson_id,
-                "reason": "not a valid PTx file (*_PTx.docx or *_PTx_<initials>.docx) or *_Transcript.docx file",
+                "reason": "ignored because this does not look like a lesson PTx or Transcript file",
             })
             continue
 
@@ -493,10 +493,12 @@ def call_llm(system: str, user: str, api_key: str, model: str = "gpt-4o") -> str
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+    # Do not send temperature. Newer reasoning models can reject custom
+    # temperature values and require the API default. Omitting the parameter
+    # keeps the same code path compatible with both newer and older models.
     request_args = {
         "model": model,
         "messages": messages,
-        "temperature": 0.65,
     }
     completion_limit = 16000
 
