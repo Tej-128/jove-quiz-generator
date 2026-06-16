@@ -1,5 +1,5 @@
 """
-JoVE Quiz Generator - Streamlit App v3.2.3 Flexible-PTx Team-Key
+JoVE Quiz Generator - Streamlit App v3.2.4
 Standalone tool: generates 120 questions (3 sets x 40) from PTx / Transcript docx files.
 """
 
@@ -110,7 +110,7 @@ with st.sidebar:
 """
     )
     st.markdown("---")
-    st.caption("JoVE Internal Tool - v3.2.3 Flexible-PTx")
+    st.caption("JoVE Internal Tool - v3.2.4")
 
 # -----------------------------------------------------------------------------
 # Upload and extraction helpers
@@ -208,21 +208,6 @@ if not api_key:
     st.stop()
 
 st.markdown('<div class="section-hdr">Upload Lesson Files</div>', unsafe_allow_html=True)
-st.markdown(
-    """
-Upload PTx files (`_PTx.docx`, `_PTx_NS.docx`, `_PTx_RS.docx`, or `_PTx_<initials>.docx`) and/or Transcript (`_Transcript.docx`) files for one chapter.
-A ZIP containing `.docx` files is also accepted.
-
-Required naming examples:
-```
-10677_What_Are_Proteins_PTx_NS.docx
-10683_What_Are_Lipids__PTx_RS.docx
-10679_Protein_Folding_PTx.docx
-10677_What_Are_Proteins_Transcript.docx
-```
-"""
-)
-
 uploaded = st.file_uploader(
     "Drop files here",
     type=["docx", "zip"],
@@ -233,7 +218,7 @@ uploaded = st.file_uploader(
 file_records, upload_errors = _collect_uploaded_files(uploaded)
 
 if not uploaded:
-    st.info("Upload PTx and/or Transcript `.docx` files to get started. ZIP accepted.")
+    st.info("Upload lesson `.docx` files or a ZIP to get started.")
     st.stop()
 
 if upload_errors:
@@ -250,7 +235,7 @@ st.markdown("---")
 st.markdown('<div class="section-hdr">Detected Lessons</div>', unsafe_allow_html=True)
 
 if not lessons:
-    st.error("No valid lesson files found. Filenames must start with a numeric Lesson ID and end with `_PTx.docx`, `_PTx_<initials>.docx`, or `_Transcript.docx`.")
+    st.error("No valid lesson files found. Make sure lesson filenames start with a numeric Lesson ID.")
     skipped = parse_report.get("skipped_files", []) or []
     if skipped:
         with st.expander("Skipped files"):
