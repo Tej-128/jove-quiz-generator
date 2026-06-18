@@ -1216,6 +1216,271 @@ def _notify(callback: Callable[..., None] | None, message: str, progress: int | 
         callback(message)
 
 
+
+
+# -----------------------------------------------------------------------------
+# Post-generation QA: duplicate scan and source-accuracy review
+# -----------------------------------------------------------------------------
+
+QA_SYSTEM_PROMPT = """You are a strict JoVE quiz quality reviewer.
+
+Review each question only against the supplied source text. Do not use outside knowledge.
+Return only a valid JSON array. No markdown. No code fences.
+
+For each question, return exactly:
+question_index, status, issue
+
+status must be "pass" or "fail".
+Use "fail" only when the correct answer is clearly unsupported, incorrect, ambiguous, duplicated, or contradicted by the source.
+Use "pass" when the question is supported by the source and the provided right_answer is correct.
+Keep issue concise.
+"""
+
+
+def _correct_answer_text(question: dict[str, Any]) -> str:
+    question_type = question.get("question_type", "")
+    right_answer = str(question.get("right_answer", "")).strip()
+
+    if question_type == "Single Correct":
+        if right_answer in {"1", "2", "3", "4"}:
+            return str(question.get(f"option_{right_answer}", ""))
+        return right_answer
+
+    if question_type == "Multi Correct":
+        values = []
+        for pos in _parse_multi_answer(right_answer):
+            if pos in {"1", "2", "3", "4"}:
+                values.append(str(question.get(f"option_{pos}", "")))
+        return " | ".join(values)
+
+    if question_type == "True or False":
+        return "TRUE" if right_answer == "1" else "FALSE" if right_answer == "2" else right_answer
+
+    if question_type in {"Fill in the Blanks", "Dropdown"}:
+        return right_answer
+
+    return ""
+
+
+def _qa_question_payload(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    payload = []
+    for question in questions:
+        payload.append({
+            "question_index": question.get("question_index", ""),
+            "lesson_id": question.get("lesson_id", ""),
+            "question_type": question.get("question_type", ""),
+            "question_content": question.get("question_content", ""),
+            "option_1": question.get("option_1", ""),
+            "option_2": question.get("option_2", ""),
+            "option_3": question.get("option_3", ""),
+            "option_4": question.get("option_4", ""),
+            "right_answer": question.get("right_answer", ""),
+            "correct_answer_text": _correct_answer_text(question),
+        })
+    return payload
+
+
+def build_accuracy_review_prompt(
+    lessons: list[dict[str, Any]],
+    set_number: int,
+    questions: list[dict[str, Any]],
+) -> str:
+    source_blocks = []
+    for lesson in lessons:
+        source = _source_for_prompt(lesson)
+        if source:
+            source_blocks.append(f"LESSON {lesson['lesson_id']}\n{source}")
+
+    return f"""Review Set {set_number} for answer accuracy and source grounding.
+
+Rules:
+- Use only the source text below.
+- Check that each question's right_answer is the correct answer according to the source.
+- Check that the question is not a duplicate or near-duplicate of another question in this set.
+- Do not fail merely because wording is paraphrased.
+- Fail only clear issues.
+
+SOURCE MATERIAL:
+{chr(10).join(source_blocks)}
+
+QUESTIONS TO REVIEW:
+{json.dumps(_qa_question_payload(questions), ensure_ascii=False)}
+
+Return JSON array only.
+"""
+
+
+def parse_accuracy_review(raw: str) -> dict[int, str]:
+    """Return {question_index: issue} for failed QA items only."""
+    failed: dict[int, str] = {}
+    try:
+        parsed = parse_llm_json(raw)
+    except Exception:
+        return failed
+
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status", "")).strip().lower()
+        if status != "fail":
+            continue
+        try:
+            question_index = int(str(item.get("question_index", "")).strip())
+        except ValueError:
+            continue
+        issue = str(item.get("issue", "QA failed")).strip() or "QA failed"
+        failed[question_index] = issue
+    return failed
+
+
+def _duplicate_indices_for_final_set(
+    questions: list[dict[str, Any]],
+    previous_questions: list[dict[str, Any]],
+) -> dict[int, str]:
+    """Defensive final duplicate check across previous accepted questions and current set."""
+    failed: dict[int, str] = {}
+    content_signatures, full_signatures, norms = _build_dedup_state(previous_questions)
+
+    for question in questions:
+        try:
+            question_index = int(question.get("question_index", 0))
+        except (TypeError, ValueError):
+            question_index = 0
+        reason = _dedup_reason(question, content_signatures, full_signatures, norms)
+        if reason:
+            failed[question_index] = reason
+            continue
+        _register_question(question, content_signatures, full_signatures, norms)
+    return failed
+
+
+def _remove_failed_questions(
+    set_questions: list[dict[str, Any]],
+    failed_by_index: dict[int, str],
+    set_number: int,
+    set_warnings: list[str],
+) -> list[dict[str, Any]]:
+    if not failed_by_index:
+        return set_questions
+
+    retained: list[dict[str, Any]] = []
+    for question in set_questions:
+        try:
+            question_index = int(question.get("question_index", 0))
+        except (TypeError, ValueError):
+            question_index = 0
+        if question_index in failed_by_index:
+            set_warnings.append(
+                f"Set {set_number}: QA removed Q{question_index} [{question.get('question_type', '')}] - {failed_by_index[question_index]}"
+            )
+        else:
+            retained.append(question)
+    _reindex(retained)
+    return retained
+
+
+def _qa_top_up_replacements(
+    lessons: list[dict[str, Any]],
+    set_number: int,
+    set_questions: list[dict[str, Any]],
+    current_budget: dict[str, int],
+    api_key: str,
+    model: str,
+    allowed_lesson_ids: set[str],
+    lessons_by_id: dict[str, dict[str, Any]],
+    all_generated: list[dict[str, Any]],
+    set_warnings: list[str],
+) -> list[dict[str, Any]]:
+    """Replace QA-removed questions using the same top-up rules and validators."""
+    used_content_signatures, used_full_signatures, used_norms = _build_dedup_state(all_generated + set_questions)
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        needed = _needed_counts(set_questions, current_budget)
+        if not needed and len(set_questions) == QUESTIONS_PER_SET:
+            break
+        if not needed:
+            break
+
+        try:
+            topup_prompt = build_topup_prompt(
+                lessons=lessons,
+                set_number=set_number,
+                needed=needed,
+                existing_snippets=[_snippet(q) for q in all_generated + set_questions],
+                next_index=len(set_questions) + 1,
+            )
+            raw_topup = call_llm(SYSTEM_PROMPT, topup_prompt, api_key, model)
+            topup_questions = parse_llm_json(raw_topup)
+        except LLMRequestError as exc:
+            raise RuntimeError(f"OpenAI request failed during QA replacement top-up attempt {attempt}: {exc}") from exc
+        except Exception as exc:
+            set_warnings.append(f"Set {set_number}: QA replacement top-up attempt {attempt} failed: {exc}")
+            topup_questions = []
+
+        _accept_candidates(
+            candidates=topup_questions,
+            set_questions=set_questions,
+            budget=current_budget,
+            wanted_types=set(needed.keys()),
+            allowed_lesson_ids=allowed_lesson_ids,
+            lessons_by_id=lessons_by_id,
+            used_content_signatures=used_content_signatures,
+            used_full_signatures=used_full_signatures,
+            used_norms=used_norms,
+            set_warnings=set_warnings,
+            phase=f"Set {set_number} QA replacement top-up attempt {attempt}",
+        )
+
+    _reindex(set_questions)
+    return set_questions
+
+
+def _run_post_generation_qa(
+    lessons: list[dict[str, Any]],
+    set_number: int,
+    set_questions: list[dict[str, Any]],
+    current_budget: dict[str, int],
+    api_key: str,
+    model: str,
+    allowed_lesson_ids: set[str],
+    lessons_by_id: dict[str, dict[str, Any]],
+    all_generated: list[dict[str, Any]],
+    set_warnings: list[str],
+    enable_ai_accuracy_qa: bool,
+) -> list[dict[str, Any]]:
+    """Run final duplicate QA and optional AI source-accuracy QA, replacing failed questions."""
+    failed_by_index = _duplicate_indices_for_final_set(set_questions, all_generated)
+
+    if enable_ai_accuracy_qa and set_questions:
+        try:
+            raw_review = call_llm(QA_SYSTEM_PROMPT, build_accuracy_review_prompt(lessons, set_number, set_questions), api_key, model)
+            ai_failed = parse_accuracy_review(raw_review)
+            for question_index, issue in ai_failed.items():
+                failed_by_index.setdefault(question_index, f"AI accuracy QA: {issue}")
+        except LLMRequestError as exc:
+            raise RuntimeError(f"OpenAI request failed during QA review for Set {set_number}: {exc}") from exc
+        except Exception as exc:
+            set_warnings.append(f"Set {set_number}: AI accuracy QA review failed, deterministic QA still applied: {exc}")
+
+    if failed_by_index:
+        set_questions = _remove_failed_questions(set_questions, failed_by_index, set_number, set_warnings)
+        set_questions = _qa_top_up_replacements(
+            lessons=lessons,
+            set_number=set_number,
+            set_questions=set_questions,
+            current_budget=current_budget,
+            api_key=api_key,
+            model=model,
+            allowed_lesson_ids=allowed_lesson_ids,
+            lessons_by_id=lessons_by_id,
+            all_generated=all_generated,
+            set_warnings=set_warnings,
+        )
+        _randomize_answer_positions(set_questions)
+
+    return set_questions
+
+
 # -----------------------------------------------------------------------------
 # Generation pipeline
 # -----------------------------------------------------------------------------
@@ -1231,6 +1496,7 @@ def generate_quiz(
     parse_warnings: list[str] | None = None,
     skipped_files: list[dict[str, str]] | None = None,
     chapter_name: str | None = None,
+    enable_ai_accuracy_qa: bool = True,
 ) -> tuple[list[list[dict[str, Any]]], dict[str, Any]]:
     """Generate three quiz sets and return (all_sets, report)."""
     if not lessons:
@@ -1403,6 +1669,19 @@ def generate_quiz(
                 break
 
         _randomize_answer_positions(set_questions)
+        set_questions = _run_post_generation_qa(
+            lessons=lessons,
+            set_number=set_number,
+            set_questions=set_questions,
+            current_budget=current_budget,
+            api_key=api_key,
+            model=model,
+            allowed_lesson_ids=allowed_lesson_ids,
+            lessons_by_id=lessons_by_id,
+            all_generated=all_generated,
+            set_warnings=set_warnings,
+            enable_ai_accuracy_qa=enable_ai_accuracy_qa,
+        )
 
         final_counts = _count_by_type(set_questions)
         if len(set_questions) != QUESTIONS_PER_SET:
