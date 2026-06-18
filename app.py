@@ -5,6 +5,7 @@ Generates one quiz Excel per chapter folder and returns a ZIP.
 
 from __future__ import annotations
 
+import gc
 import io
 import os
 import re
@@ -355,8 +356,9 @@ if st.button("Generate All Chapter Quizzes", type="primary", use_container_width
     chapter_summaries: list[dict[str, Any]] = []
     batch_warnings: list[str] = []
     batch_errors: list[str] = []
-
-    output_buffer = io.BytesIO()
+    completed_chapters: set[str] = set()
+    output_files: list[tuple[str, str]] = []
+    output_dir = tempfile.mkdtemp(prefix="jove_quiz_outputs_")
 
     def log(message: str, progress: int | None = None) -> None:
         logs.append(message)
@@ -365,12 +367,23 @@ if st.button("Generate All Chapter Quizzes", type="primary", use_container_width
         log_area.markdown("\n".join(f"- {line}" for line in logs[-12:]))
 
     try:
-        with zipfile.ZipFile(output_buffer, "w", zipfile.ZIP_DEFLATED) as output_zip:
-            for chapter_index, (chapter_key, records) in enumerate(grouped_records.items(), 1):
-                chapter_base_progress = int(((chapter_index - 1) / max(1, chapter_count)) * 100)
-                chapter_done_progress = int((chapter_index / max(1, chapter_count)) * 100)
-                log(f"Processing {chapter_key} ({chapter_index}/{chapter_count})", chapter_base_progress)
+        for chapter_index, (chapter_key, records) in enumerate(grouped_records.items(), 1):
+            chapter_base_progress = int(((chapter_index - 1) / max(1, chapter_count)) * 100)
+            chapter_done_progress = int((chapter_index / max(1, chapter_count)) * 100)
 
+            if chapter_key in completed_chapters:
+                log(f"Skipping {chapter_key}: already completed in this run", chapter_done_progress)
+                continue
+
+            log(f"Processing {chapter_key} ({chapter_index}/{chapter_count})", chapter_base_progress)
+
+            lessons = []
+            parse_report: dict[str, Any] = {}
+            all_sets = None
+            report = None
+            workbook = None
+
+            try:
                 lessons, parse_report = parse_lesson_files(records, return_report=True)
                 chapter_name = parse_report.get("chapter_name", "")
                 content_lessons = [lesson for lesson in lessons if lesson.get("pt_text") or lesson.get("transcript_text")]
@@ -381,13 +394,15 @@ if st.button("Generate All Chapter Quizzes", type="primary", use_container_width
                 if not lessons or not content_lessons:
                     message = f"{chapter_key}: skipped because no readable lesson content was detected."
                     batch_errors.append(message)
-                    log(message)
+                    log(message, chapter_done_progress)
+                    completed_chapters.add(chapter_key)
                     continue
 
                 if not chapter_name:
                     message = f"{chapter_key}: skipped because chapter name was not found in PTx content."
                     batch_errors.append(message)
-                    log(message)
+                    log(message, chapter_done_progress)
+                    completed_chapters.add(chapter_key)
                     continue
 
                 def progress_callback(message: str, progress: int | None = None) -> None:
@@ -411,14 +426,12 @@ if st.button("Generate All Chapter Quizzes", type="primary", use_container_width
                 )
 
                 workbook = build_excel(all_sets, report, chapter_name)
-                excel_buffer = io.BytesIO()
-                workbook.save(excel_buffer)
-                excel_bytes = excel_buffer.getvalue()
-
                 safe_chapter = _safe_filename(chapter_key)
                 safe_chapter_name = _safe_filename(chapter_name)
                 output_name = f"{safe_chapter}__{safe_chapter_name}.xlsx"
-                output_zip.writestr(output_name, excel_bytes)
+                output_path = os.path.join(output_dir, output_name)
+                workbook.save(output_path)
+                output_files.append((output_name, output_path))
 
                 total_generated = sum(len(question_set) for question_set in all_sets)
                 warning_count = len(report.get("warnings", []) or [])
@@ -431,10 +444,54 @@ if st.button("Generate All Chapter Quizzes", type="primary", use_container_width
                     "Questions": total_generated,
                     "Warnings": warning_count,
                     "Output File": output_name,
+                    "Status": "Completed",
                 })
-                log(f"Finished {chapter_key}: {total_generated} questions", chapter_done_progress)
+                completed_chapters.add(chapter_key)
+                log(f"Saved {chapter_key} to disk and clearing memory", chapter_done_progress)
 
-        zip_bytes = output_buffer.getvalue()
+            except Exception as chapter_exc:
+                error_message = f"{chapter_key}: failed - {chapter_exc}"
+                batch_errors.append(error_message)
+                chapter_summaries.append({
+                    "Chapter Folder": chapter_key,
+                    "Chapter Name": parse_report.get("chapter_name", "") if parse_report else "",
+                    "Lessons": len(lessons) if lessons else 0,
+                    "Content Lessons": "",
+                    "Questions": 0,
+                    "Warnings": "",
+                    "Output File": "",
+                    "Status": "Failed",
+                })
+                log(error_message, chapter_done_progress)
+                log(traceback.format_exc())
+                # Do not mark failed chapters as completed; they are not written to output.
+
+            finally:
+                # Clear large per-chapter objects only after the chapter is fully saved or failed.
+                try:
+                    if workbook is not None:
+                        workbook.close()
+                except Exception:
+                    pass
+                del lessons
+                del parse_report
+                del all_sets
+                del report
+                del workbook
+                gc.collect()
+
+        if not output_files:
+            raise RuntimeError("No chapter Excel files were created.")
+
+        final_zip_path = os.path.join(output_dir, "JoVE_Chapter_Quizzes.zip")
+        with zipfile.ZipFile(final_zip_path, "w", zipfile.ZIP_DEFLATED) as output_zip:
+            for output_name, output_path in output_files:
+                if os.path.exists(output_path):
+                    output_zip.write(output_path, arcname=output_name)
+
+        with open(final_zip_path, "rb") as zip_file:
+            zip_bytes = zip_file.read()
+
         if not zip_bytes:
             raise RuntimeError("No output ZIP was created.")
 
