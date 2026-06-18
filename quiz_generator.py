@@ -19,6 +19,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import random
 import re
 from pathlib import Path
 from typing import Any, Callable
@@ -1024,6 +1025,170 @@ def _lesson_distribution_warnings(
     return warnings
 
 
+
+def _shuffle_options_and_remap_answers(
+    question: dict[str, Any],
+    correct_positions: set[int],
+    rng: random.Random,
+) -> bool:
+    """Randomly shuffle option_1..option_4 and remap correct answer positions."""
+    if not correct_positions or not correct_positions.issubset({1, 2, 3, 4}):
+        return False
+
+    old_options = [question.get(f"option_{idx}", "") for idx in range(1, 5)]
+    if any(not option for option in old_options):
+        return False
+
+    permutation = [1, 2, 3, 4]
+    for _ in range(12):
+        rng.shuffle(permutation)
+        if permutation != [1, 2, 3, 4]:
+            break
+
+    # permutation[new_position - 1] = old_position
+    new_options = [old_options[old_position - 1] for old_position in permutation]
+    new_correct_positions = {
+        new_position
+        for new_position, old_position in enumerate(permutation, 1)
+        if old_position in correct_positions
+    }
+
+    for idx, option in enumerate(new_options, 1):
+        question[f"option_{idx}"] = option
+    question["right_answer"] = ",".join(str(pos) for pos in sorted(new_correct_positions))
+    return True
+
+
+def _randomize_single_correct_positions(questions: list[dict[str, Any]]) -> int:
+    """
+    Randomize Single Correct answer positions without a guessable pattern.
+
+    The target positions are balanced across 1-4, then shuffled randomly. This keeps
+    option_1 from dominating while avoiding a predictable 1/2/3/4 cycle.
+    """
+    single_correct_questions = [
+        question for question in questions
+        if question.get("question_type") == "Single Correct"
+    ]
+    if not single_correct_questions:
+        return 0
+
+    rng = random.SystemRandom()
+    total = len(single_correct_questions)
+    base_count, remainder = divmod(total, 4)
+
+    target_positions: list[int] = []
+    for position in [1, 2, 3, 4]:
+        target_positions.extend([position] * base_count)
+
+    extra_positions = [1, 2, 3, 4]
+    rng.shuffle(extra_positions)
+    target_positions.extend(extra_positions[:remainder])
+    rng.shuffle(target_positions)
+
+    changed = 0
+    for question, target_position in zip(single_correct_questions, target_positions):
+        try:
+            current_position = int(str(question.get("right_answer", "")).strip())
+        except ValueError:
+            continue
+        if current_position not in {1, 2, 3, 4}:
+            continue
+
+        old_options = [question.get(f"option_{idx}", "") for idx in range(1, 5)]
+        if any(not option for option in old_options):
+            continue
+
+        correct_value = old_options[current_position - 1]
+        distractors = [
+            option
+            for idx, option in enumerate(old_options, 1)
+            if idx != current_position
+        ]
+        rng.shuffle(distractors)
+
+        new_options: list[str] = []
+        distractor_index = 0
+        for position in range(1, 5):
+            if position == target_position:
+                new_options.append(correct_value)
+            else:
+                new_options.append(distractors[distractor_index])
+                distractor_index += 1
+
+        if new_options != old_options or str(target_position) != str(question.get("right_answer", "")):
+            for idx, option in enumerate(new_options, 1):
+                question[f"option_{idx}"] = option
+            question["right_answer"] = str(target_position)
+            changed += 1
+
+    return changed
+
+
+def _randomize_multi_correct_positions(questions: list[dict[str, Any]]) -> int:
+    """
+    Randomly shuffle Multi Correct options and remap right_answer.
+
+    Option 1 may still be correct sometimes, but it is prevented from appearing in
+    more than roughly half of Multi Correct answer keys.
+    """
+    multi_questions = [
+        question for question in questions
+        if question.get("question_type") == "Multi Correct"
+    ]
+    if not multi_questions:
+        return 0
+
+    rng = random.SystemRandom()
+    changed = 0
+
+    for question in multi_questions:
+        correct_positions = {
+            int(pos)
+            for pos in _parse_multi_answer(str(question.get("right_answer", "")))
+        }
+        if _shuffle_options_and_remap_answers(question, correct_positions, rng):
+            changed += 1
+
+    max_with_one = max(1, (len(multi_questions) + 1) // 2)
+    for _ in range(20):
+        questions_with_one = [
+            question for question in multi_questions
+            if "1" in _parse_multi_answer(str(question.get("right_answer", "")))
+        ]
+        if len(questions_with_one) <= max_with_one:
+            break
+
+        question = rng.choice(questions_with_one)
+        correct_positions = {
+            int(pos)
+            for pos in _parse_multi_answer(str(question.get("right_answer", "")))
+        }
+        old_options = [question.get(f"option_{idx}", "") for idx in range(1, 5)]
+        old_answer = str(question.get("right_answer", ""))
+
+        for _attempt in range(12):
+            trial = {f"option_{idx}": old_options[idx - 1] for idx in range(1, 5)}
+            trial["right_answer"] = old_answer
+            if not _shuffle_options_and_remap_answers(trial, correct_positions, rng):
+                continue
+            if "1" not in _parse_multi_answer(str(trial.get("right_answer", ""))):
+                for idx in range(1, 5):
+                    question[f"option_{idx}"] = trial[f"option_{idx}"]
+                question["right_answer"] = trial["right_answer"]
+                changed += 1
+                break
+        else:
+            break
+
+    return changed
+
+
+def _randomize_answer_positions(questions: list[dict[str, Any]]) -> None:
+    """Randomize answer positions for Single Correct and Multi Correct only."""
+    _randomize_single_correct_positions(questions)
+    _randomize_multi_correct_positions(questions)
+
 def _single_correct_position_warnings(questions: list[dict[str, Any]], set_number: int) -> list[str]:
     sc_answers = [q.get("right_answer", "") for q in questions if q.get("question_type") == "Single Correct"]
     if len(sc_answers) < 2:
@@ -1236,6 +1401,8 @@ def generate_quiz(
 
             if fallback_rounds > len(FALLBACK_PRIORITY):
                 break
+
+        _randomize_answer_positions(set_questions)
 
         final_counts = _count_by_type(set_questions)
         if len(set_questions) != QUESTIONS_PER_SET:
