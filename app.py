@@ -1,15 +1,17 @@
 """
-JoVE Quiz Generator - Streamlit App v3.3 Batch QA
+JoVE Quiz Generator - Streamlit App v3.3.1 Batch QA Auto-Download
 Generates one quiz Excel per chapter folder and returns a ZIP.
 """
 
 from __future__ import annotations
 
+import base64
 import gc
 import io
 import os
 import re
 import tempfile
+import time
 import traceback
 import zipfile
 from pathlib import Path
@@ -17,6 +19,7 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from excel_export import build_excel
 from quiz_generator import (
@@ -101,7 +104,7 @@ with st.sidebar:
 """
     )
     st.markdown("---")
-    st.caption("JoVE Internal Tool - v3.3 Batch QA")
+    st.caption("JoVE Internal Tool - v3.3.1 Batch QA Auto-Download")
 
 
 # -----------------------------------------------------------------------------
@@ -212,6 +215,75 @@ def _safe_filename(value: str) -> str:
     return cleaned or "Chapter"
 
 
+def _auto_download_bytes(data: bytes, file_name: str, mime: str, nonce: str) -> None:
+    """
+    Best-effort browser auto-download.
+
+    Streamlit does not provide a native automatic download API, so this uses a
+    small browser-side anchor click. Some browsers may ask permission before
+    allowing repeated automatic downloads; the app also keeps a manual download
+    button visible for the latest completed output.
+    """
+    if not data:
+        return
+    safe_name = file_name.replace("\\", "_").replace("/", "_").replace('"', "_")
+    encoded = base64.b64encode(data).decode("ascii")
+    components.html(
+        f"""
+        <html>
+          <body>
+            <script>
+              (function() {{
+                const marker = "jove-auto-download-{nonce}";
+                if (window[marker]) {{ return; }}
+                window[marker] = true;
+                const link = document.createElement("a");
+                link.href = "data:{mime};base64,{encoded}";
+                link.download = "{safe_name}";
+                link.style.display = "none";
+                document.body.appendChild(link);
+                link.click();
+                setTimeout(function() {{
+                  document.body.removeChild(link);
+                }}, 500);
+              }})();
+            </script>
+          </body>
+        </html>
+        """,
+        height=0,
+    )
+
+
+def _write_batch_log(log_path: str, message: str) -> None:
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        log_file.write(message.rstrip() + "\n")
+
+
+def _write_batch_summary_csv(summary_path: str, chapter_summaries: list[dict[str, Any]]) -> None:
+    if not chapter_summaries:
+        return
+    pd.DataFrame(chapter_summaries).to_csv(summary_path, index=False)
+
+
+def _build_output_zip(
+    zip_path: str,
+    output_files: list[tuple[str, str]],
+    log_path: str,
+    summary_path: str,
+) -> bytes:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as output_zip:
+        for output_name, output_path in output_files:
+            if os.path.exists(output_path):
+                output_zip.write(output_path, arcname=output_name)
+        if os.path.exists(log_path):
+            output_zip.write(log_path, arcname="batch_run_log.txt")
+        if os.path.exists(summary_path):
+            output_zip.write(summary_path, arcname="batch_summary.csv")
+    with open(zip_path, "rb") as zip_file:
+        return zip_file.read()
+
+
 def _build_type_distribution(report: dict[str, Any]) -> pd.DataFrame:
     rows = []
     set_reports = report.get("sets", []) or []
@@ -290,7 +362,7 @@ grouped_records = _group_records_by_chapter(file_records)
 
 st.markdown("---")
 st.markdown('<div class="section-hdr">Detected Chapters</div>', unsafe_allow_html=True)
-st.dataframe(_build_chapter_preview(grouped_records), hide_index=True, use_container_width=True)
+st.dataframe(_build_chapter_preview(grouped_records), hide_index=True, width="stretch")
 
 chapter_count = len(grouped_records)
 docx_count = len(file_records)
@@ -314,7 +386,7 @@ def _render_batch_result(result: dict[str, Any]) -> None:
 
     summary_df = pd.DataFrame(result.get("chapter_summaries", []))
     if not summary_df.empty:
-        st.dataframe(summary_df, hide_index=True, use_container_width=True)
+        st.dataframe(summary_df, hide_index=True, width="stretch")
 
     if result.get("errors"):
         with st.expander(f"Chapter errors / skipped chapters ({len(result['errors'])})"):
@@ -333,7 +405,7 @@ def _render_batch_result(result: dict[str, Any]) -> None:
         "data": result["zip_bytes"],
         "file_name": "JoVE_Chapter_Quizzes.zip",
         "mime": "application/zip",
-        "use_container_width": True,
+        "width": "stretch",
         "type": "primary",
     }
     try:
@@ -348,7 +420,7 @@ st.markdown(
     f"Will generate one Excel per detected chapter folder: **{chapter_count} chapter(s)** x **{NUM_SETS * QUESTIONS_PER_SET} questions**."
 )
 
-if st.button("Generate All Chapter Quizzes", type="primary", use_container_width=True):
+if st.button("Generate All Chapter Quizzes", type="primary", width="stretch"):
     progress_bar = st.progress(0)
     status_area = st.empty()
     log_area = st.empty()
@@ -359,9 +431,15 @@ if st.button("Generate All Chapter Quizzes", type="primary", use_container_width
     completed_chapters: set[str] = set()
     output_files: list[tuple[str, str]] = []
     output_dir = tempfile.mkdtemp(prefix="jove_quiz_outputs_")
+    log_path = os.path.join(output_dir, "batch_run_log.txt")
+    summary_path = os.path.join(output_dir, "batch_summary.csv")
+    partial_zip_path = os.path.join(output_dir, "JoVE_Chapter_Quizzes_PARTIAL.zip")
+    latest_download_area = st.empty()
+    auto_download_area = st.empty()
 
     def log(message: str, progress: int | None = None) -> None:
         logs.append(message)
+        _write_batch_log(log_path, message)
         if progress is not None:
             progress_bar.progress(max(0, min(100, int(progress))))
         log_area.markdown("\n".join(f"- {line}" for line in logs[-12:]))
@@ -433,6 +511,9 @@ if st.button("Generate All Chapter Quizzes", type="primary", use_container_width
                 workbook.save(output_path)
                 output_files.append((output_name, output_path))
 
+                with open(output_path, "rb") as completed_excel:
+                    excel_bytes = completed_excel.read()
+
                 total_generated = sum(len(question_set) for question_set in all_sets)
                 warning_count = len(report.get("warnings", []) or [])
                 batch_warnings.extend([f"{chapter_key}: {warning}" for warning in (report.get("warnings", []) or [])])
@@ -447,7 +528,41 @@ if st.button("Generate All Chapter Quizzes", type="primary", use_container_width
                     "Status": "Completed",
                 })
                 completed_chapters.add(chapter_key)
-                log(f"Saved {chapter_key} to disk and clearing memory", chapter_done_progress)
+
+                _write_batch_summary_csv(summary_path, chapter_summaries)
+                partial_zip_bytes = _build_output_zip(partial_zip_path, output_files, log_path, summary_path)
+
+                with latest_download_area.container():
+                    st.markdown("### Latest completed output")
+                    st.success(f"Completed {len(output_files)}/{chapter_count}: {chapter_key}")
+                    st.download_button(
+                        label=f"Download latest completed chapter: {output_name}",
+                        data=excel_bytes,
+                        file_name=output_name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"download_chapter_{chapter_index}_{_safe_filename(chapter_key)}",
+                        width="stretch",
+                    )
+                    st.download_button(
+                        label=f"Download current completed ZIP ({len(output_files)}/{chapter_count} chapters)",
+                        data=partial_zip_bytes,
+                        file_name="JoVE_Chapter_Quizzes_PARTIAL.zip",
+                        mime="application/zip",
+                        key=f"download_partial_zip_{chapter_index}_{_safe_filename(chapter_key)}",
+                        width="stretch",
+                    )
+
+                auto_download_area.empty()
+                with auto_download_area.container():
+                    _auto_download_bytes(
+                        excel_bytes,
+                        output_name,
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        f"chapter-{chapter_index}-{_safe_filename(chapter_key)}",
+                    )
+                time.sleep(0.75)
+
+                log(f"Saved {chapter_key}; auto-download triggered; clearing memory", chapter_done_progress)
 
             except Exception as chapter_exc:
                 error_message = f"{chapter_key}: failed - {chapter_exc}"
@@ -462,6 +577,7 @@ if st.button("Generate All Chapter Quizzes", type="primary", use_container_width
                     "Output File": "",
                     "Status": "Failed",
                 })
+                _write_batch_summary_csv(summary_path, chapter_summaries)
                 log(error_message, chapter_done_progress)
                 log(traceback.format_exc())
                 # Do not mark failed chapters as completed; they are not written to output.
@@ -484,13 +600,17 @@ if st.button("Generate All Chapter Quizzes", type="primary", use_container_width
             raise RuntimeError("No chapter Excel files were created.")
 
         final_zip_path = os.path.join(output_dir, "JoVE_Chapter_Quizzes.zip")
-        with zipfile.ZipFile(final_zip_path, "w", zipfile.ZIP_DEFLATED) as output_zip:
-            for output_name, output_path in output_files:
-                if os.path.exists(output_path):
-                    output_zip.write(output_path, arcname=output_name)
+        _write_batch_summary_csv(summary_path, chapter_summaries)
+        zip_bytes = _build_output_zip(final_zip_path, output_files, log_path, summary_path)
 
-        with open(final_zip_path, "rb") as zip_file:
-            zip_bytes = zip_file.read()
+        auto_download_area.empty()
+        with auto_download_area.container():
+            _auto_download_bytes(
+                zip_bytes,
+                "JoVE_Chapter_Quizzes.zip",
+                "application/zip",
+                "final-batch-zip",
+            )
 
         if not zip_bytes:
             raise RuntimeError("No output ZIP was created.")
