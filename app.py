@@ -104,7 +104,7 @@ with st.sidebar:
 """
     )
     st.markdown("---")
-    st.caption("JoVE Internal Tool - v3.3.1 Batch QA Auto-Download")
+    st.caption("JoVE Internal Tool - v3.3.2 Batch QA ZIP + Folder Upload")
 
 
 # -----------------------------------------------------------------------------
@@ -185,16 +185,24 @@ def _collect_uploaded_files(uploaded_files) -> tuple[list[dict[str, str]], list[
             except Exception as exc:
                 errors.append(f"{uploaded_file.name}: ZIP extraction failed: {exc}")
         else:
+            relative_path = uploaded_file.name.replace("\\", "/")
+            member_name = Path(relative_path).name
+            if not member_name.lower().endswith(".docx"):
+                continue
+            if member_name.startswith("~$"):
+                continue
+
+            chapter_key = _infer_chapter_key(relative_path)
             counter += 1
-            dest = _safe_unique_path(temp_dir, uploaded_file.name, counter)
+            dest = _safe_unique_path(temp_dir, member_name, counter)
             try:
                 with open(dest, "wb") as output_file:
                     output_file.write(uploaded_file.getbuffer())
                 file_records.append({
-                    "name": uploaded_file.name,
+                    "name": member_name,
                     "path": dest,
-                    "relative_path": uploaded_file.name,
-                    "chapter_key": "Uploaded_Chapter",
+                    "relative_path": relative_path,
+                    "chapter_key": chapter_key,
                 })
             except Exception as exc:
                 errors.append(f"{uploaded_file.name}: upload save failed: {exc}")
@@ -334,20 +342,40 @@ if not api_key:
     st.error("OpenAI API key is not configured. Add OPENAI_API_KEY to Streamlit Secrets or set it as an environment variable.")
     st.stop()
 
-st.markdown('<div class="section-hdr">Upload Chapter ZIP</div>', unsafe_allow_html=True)
-st.info("Upload one ZIP that contains all Chapter folders. The app will return one ZIP containing one Excel quiz file per detected chapter.")
-
-uploaded = st.file_uploader(
-    "Drop ZIP or DOCX files here",
-    type=["docx", "zip"],
-    accept_multiple_files=True,
-    label_visibility="collapsed",
+st.markdown('<div class="section-hdr">Upload Chapter Files</div>', unsafe_allow_html=True)
+st.info(
+    "Upload either a ZIP containing Chapter folders, individual DOCX files, or select a folder directly. "
+    "The app will return one ZIP containing one Excel quiz file per detected chapter."
 )
+
+upload_mode = st.radio(
+    "Upload method",
+    ["ZIP / DOCX files", "Direct folder upload"],
+    horizontal=True,
+    help="Use ZIP / DOCX files for normal uploads. Use Direct folder upload to select a folder that contains chapter folders.",
+)
+
+if upload_mode == "Direct folder upload":
+    uploaded = st.file_uploader(
+        "Select a folder containing chapter folders",
+        type=["docx", "zip"],
+        accept_multiple_files="directory",
+        label_visibility="collapsed",
+        key="folder_upload",
+    )
+else:
+    uploaded = st.file_uploader(
+        "Drop ZIP or DOCX files here",
+        type=["docx", "zip"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+        key="file_upload",
+    )
 
 file_records, upload_errors = _collect_uploaded_files(uploaded)
 
 if not uploaded:
-    st.info("Upload a ZIP containing chapter folders to get started.")
+    st.info("Upload a ZIP, DOCX files, or select a folder containing chapter folders to get started.")
     st.stop()
 
 if upload_errors:
@@ -374,7 +402,7 @@ with cols[1]:
 with cols[2]:
     st.markdown(f'<div class="stat-box"><div class="stat-label">Expected Questions</div><div class="stat-value">{chapter_count * NUM_SETS * QUESTIONS_PER_SET}</div></div>', unsafe_allow_html=True)
 
-upload_signature = tuple((uploaded_file.name, getattr(uploaded_file, "size", None)) for uploaded_file in uploaded)
+upload_signature = (upload_mode, tuple((uploaded_file.name, getattr(uploaded_file, "size", None)) for uploaded_file in uploaded))
 if st.session_state.upload_signature != upload_signature:
     st.session_state.upload_signature = upload_signature
     st.session_state.batch_result = None
