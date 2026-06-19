@@ -360,9 +360,10 @@ Dropdown:
 - question_content contains 1 or 2 placeholders: ---[dropdown 1]--- and optionally ---[dropdown 2]---.
 - option_1 contains exactly 4 pipe-separated choices for dropdown 1.
 - option_2 contains exactly 4 pipe-separated choices for dropdown 2 only if there are 2 dropdowns.
-- The correct answer is always the first pipe-separated item in each dropdown option field.
+- The correct choice may appear in any position within each pipe-separated dropdown option field.
 - option_3 and option_4 are empty strings.
-- right_answer is "1" for one dropdown or "1,2" for two dropdowns.
+- right_answer is the correct choice position for each dropdown, for example "2" for one dropdown or "3,1" for two dropdowns.
+- Vary correct-answer positions across Dropdown questions.
 
 Match the following:
 - Use exactly 3 or 4 pairs.
@@ -774,18 +775,23 @@ def validate_and_repair(
         n_dropdowns = len(placeholder_numbers)
         if n_dropdowns not in {1, 2}:
             errors.append(f"Q{index} [Dropdown]: question_content must contain 1 or 2 dropdown placeholders")
-        if n_dropdowns >= 1:
-            expected_answer = "1" if n_dropdowns == 1 else "1,2"
-            if clean["right_answer"] != expected_answer:
-                warnings.append(
-                    f"Q{index} [Dropdown]: right_answer repaired from '{clean['right_answer']}' to '{expected_answer}'"
+        answers = _parse_multi_answer(clean["right_answer"])
+        if n_dropdowns in {1, 2}:
+            if len(answers) != n_dropdowns:
+                errors.append(
+                    f"Q{index} [Dropdown]: right_answer must contain exactly {n_dropdowns} dropdown choice position(s)"
                 )
-                clean["right_answer"] = expected_answer
+            elif any(answer not in {"1", "2", "3", "4"} for answer in answers):
+                errors.append(f"Q{index} [Dropdown]: right_answer contains invalid dropdown choice positions")
+            else:
+                clean["right_answer"] = ",".join(answers)
         for idx in range(1, min(n_dropdowns, 2) + 1):
             option_key = f"option_{idx}"
             parts = _split_pipe(clean[option_key])
             if len(parts) != 4 or any(not part for part in parts):
                 errors.append(f"Q{index} [Dropdown]: {option_key} must have exactly 4 non-empty pipe-separated choices")
+            elif not _all_distinct(parts):
+                errors.append(f"Q{index} [Dropdown]: {option_key} choices must be distinct")
             else:
                 clean[option_key] = " | ".join(parts)
         for idx in range(min(n_dropdowns, 2) + 1, 5):
@@ -1184,10 +1190,88 @@ def _randomize_multi_correct_positions(questions: list[dict[str, Any]]) -> int:
     return changed
 
 
+def _randomize_dropdown_positions(questions: list[dict[str, Any]]) -> int:
+    """Randomize Dropdown pipe-choice positions and remap right_answer.
+
+    For Dropdown, option_1 and option_2 each contain a pipe-separated choice list.
+    right_answer stores the correct choice position within each list. This balances
+    correct positions across 1-4 so the first pipe item does not always reveal the answer.
+    """
+    occurrences: list[tuple[dict[str, Any], int, int]] = []
+    for question in questions:
+        if question.get("question_type") != "Dropdown":
+            continue
+        answers = _parse_multi_answer(str(question.get("right_answer", "")))
+        if len(answers) not in {1, 2}:
+            continue
+        for answer_index, answer in enumerate(answers):
+            if answer not in {"1", "2", "3", "4"}:
+                continue
+            option_number = answer_index + 1
+            option_value = str(question.get(f"option_{option_number}", ""))
+            parts = _split_pipe(option_value)
+            if len(parts) == 4 and all(parts) and _all_distinct(parts):
+                occurrences.append((question, option_number, int(answer)))
+
+    if not occurrences:
+        return 0
+
+    rng = random.SystemRandom()
+    total = len(occurrences)
+    base_count, remainder = divmod(total, 4)
+    target_positions: list[int] = []
+    for position in [1, 2, 3, 4]:
+        target_positions.extend([position] * base_count)
+    extra_positions = [1, 2, 3, 4]
+    rng.shuffle(extra_positions)
+    target_positions.extend(extra_positions[:remainder])
+    rng.shuffle(target_positions)
+
+    changed = 0
+    updated_answers: dict[int, list[str]] = {}
+    for (question, option_number, current_position), target_position in zip(occurrences, target_positions):
+        option_key = f"option_{option_number}"
+        old_parts = _split_pipe(str(question.get(option_key, "")))
+        if len(old_parts) != 4 or current_position not in {1, 2, 3, 4}:
+            continue
+
+        correct_value = old_parts[current_position - 1]
+        distractors = [part for idx, part in enumerate(old_parts, 1) if idx != current_position]
+        rng.shuffle(distractors)
+
+        new_parts: list[str] = []
+        distractor_index = 0
+        for position in range(1, 5):
+            if position == target_position:
+                new_parts.append(correct_value)
+            else:
+                new_parts.append(distractors[distractor_index])
+                distractor_index += 1
+
+        if new_parts != old_parts:
+            question[option_key] = " | ".join(new_parts)
+            changed += 1
+
+        question_id = id(question)
+        answers = updated_answers.setdefault(question_id, _parse_multi_answer(str(question.get("right_answer", ""))))
+        if len(answers) >= option_number:
+            answers[option_number - 1] = str(target_position)
+
+    for question in questions:
+        if question.get("question_type") != "Dropdown":
+            continue
+        answers = updated_answers.get(id(question))
+        if answers:
+            question["right_answer"] = ",".join(answers)
+
+    return changed
+
+
 def _randomize_answer_positions(questions: list[dict[str, Any]]) -> None:
-    """Randomize answer positions for Single Correct and Multi Correct only."""
+    """Randomize answer positions for Single Correct, Multi Correct, and Dropdown."""
     _randomize_single_correct_positions(questions)
     _randomize_multi_correct_positions(questions)
+    _randomize_dropdown_positions(questions)
 
 def _single_correct_position_warnings(questions: list[dict[str, Any]], set_number: int) -> list[str]:
     sc_answers = [q.get("right_answer", "") for q in questions if q.get("question_type") == "Single Correct"]
@@ -1256,8 +1340,17 @@ def _correct_answer_text(question: dict[str, Any]) -> str:
     if question_type == "True or False":
         return "TRUE" if right_answer == "1" else "FALSE" if right_answer == "2" else right_answer
 
-    if question_type in {"Fill in the Blanks", "Dropdown"}:
+    if question_type == "Fill in the Blanks":
         return right_answer
+
+    if question_type == "Dropdown":
+        values = []
+        for answer_index, pos in enumerate(_parse_multi_answer(right_answer), 1):
+            if pos in {"1", "2", "3", "4"}:
+                choices = _split_pipe(str(question.get(f"option_{answer_index}", "")))
+                if len(choices) >= int(pos):
+                    values.append(choices[int(pos) - 1])
+        return " | ".join(values)
 
     return ""
 
